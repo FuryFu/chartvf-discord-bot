@@ -4,8 +4,10 @@ import io
 from json import JSONDecodeError
 import logging
 import os
+import random
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from charting import (
@@ -31,6 +33,19 @@ from charting import (
 import aiohttp
 import discord
 from dotenv import load_dotenv
+
+import re
+
+from review_archive import (
+    download_notion_review,
+    download_notion_review_hard_timeout,
+    classify_review_error,
+    initialize_database,
+    review_exists,
+    save_review,
+    ReviewBrowserSession,
+    reset_review_archive,
+)
 
 
 class MarketDataProviderError(RuntimeError):
@@ -128,7 +143,436 @@ USER_AGENT = (
 LOGGER = logging.getLogger("chartvf")
 FETCH_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_FETCHES)
 RENDER_SEMAPHORE = asyncio.Semaphore(1)
+REVIEW_IMPORT_EXECUTOR = ThreadPoolExecutor(max_workers=1)
 
+REVIEW_ADMIN_USER_ID = 535717544514813952
+
+NOTION_URL_PATTERN = re.compile(
+    r"https?://[^\s<>]+(?:notion\.site|notion\.so)[^\s<>]*",
+    re.IGNORECASE,
+)
+
+
+def extract_notion_urls(text: str) -> list[str]:
+    """Find public Notion URLs inside a Discord message."""
+
+    urls = []
+
+    for match in NOTION_URL_PATTERN.findall(text):
+        url = match.rstrip(".,)>]}'\"")
+
+        if url not in urls:
+            urls.append(url)
+
+    return urls
+async def archive_discord_review(
+    message: discord.Message,
+    notion_url: str,
+) -> None:
+    """Archive a live review, retrying temporary Notion/browser failures."""
+
+    retry_delays = (0, 5 * 60, 15 * 60, 30 * 60)
+    trader_name = (
+        message.author.display_name
+        if hasattr(message.author, "display_name")
+        else message.author.name
+    )
+    posted_at = message.created_at.isoformat()
+
+    for attempt, delay in enumerate(retry_delays, start=1):
+        if delay:
+            LOGGER.warning(
+                "review_archive retry_wait attempt=%d/%d seconds=%d user=%s",
+                attempt, len(retry_delays), delay, trader_name,
+            )
+            await asyncio.sleep(delay)
+
+        try:
+            # Recheck before every attempt so retries/concurrent tasks stay safe.
+            if await asyncio.to_thread(review_exists, notion_url):
+                LOGGER.info(
+                    "review_archive outcome=duplicate attempt=%d user=%s",
+                    attempt, message.author.id,
+                )
+                return
+
+            LOGGER.info(
+                "review_archive outcome=starting attempt=%d/%d user=%s",
+                attempt, len(retry_delays), trader_name,
+            )
+
+            # Killable child-process downloader: a wedged browser cannot hang
+            # the Discord bot indefinitely.
+            result = await asyncio.to_thread(
+                download_notion_review_hard_timeout,
+                notion_url,
+                trader_name,
+                posted_at,
+                300,
+            )
+
+            inserted = await asyncio.to_thread(
+                save_review,
+                message.author.id,
+                trader_name,
+                message.id,
+                message.jump_url,
+                notion_url,
+                result["title"],
+                result["text"],
+                posted_at,
+                result["archive_folder"],
+            )
+
+            if inserted:
+                LOGGER.info(
+                    "review_archive outcome=success attempt=%d user=%s images=%d",
+                    attempt, trader_name, len(result["images"]),
+                )
+                try:
+                    await message.add_reaction("✅")
+                except discord.HTTPException:
+                    LOGGER.warning(
+                        "review_archive reaction_failed message=%s", message.id
+                    )
+            else:
+                LOGGER.info(
+                    "review_archive outcome=duplicate_after_download attempt=%d user=%s",
+                    attempt, message.author.id,
+                )
+            return
+
+        except Exception as exc:
+            category = classify_review_error(exc)
+            LOGGER.exception(
+                "review_archive outcome=attempt_error attempt=%d/%d category=%s message=%s",
+                attempt, len(retry_delays), category, message.id,
+            )
+
+            if attempt < len(retry_delays):
+                continue
+
+            LOGGER.error(
+                "review_archive outcome=failed_final category=%s message=%s url=%s",
+                category, message.id, notion_url,
+            )
+            try:
+                await message.add_reaction("❌")
+            except discord.HTTPException:
+                pass
+
+async def import_historical_reviews(
+    command_message: discord.Message,
+    limit: int | None = None,
+) -> None:
+    """Scan the review channel and archive historical Notion reviews."""
+
+    SUCCESS_DELAY_MIN = 45
+    SUCCESS_DELAY_MAX = 75
+    RATE_LIMIT_COOLDOWN_MIN = 600
+    RATE_LIMIT_COOLDOWN_MAX = 720
+    CHALLENGE_COOLDOWN_MIN = 900
+    CHALLENGE_COOLDOWN_MAX = 1080
+    TIMEOUT_COOLDOWN_MIN = 60
+    TIMEOUT_COOLDOWN_MAX = 120
+    BATCH_SUCCESS_TARGET = 10
+    BATCH_REST_MIN = 300
+    BATCH_REST_MAX = 420
+
+    review_channel_id = os.getenv("REVIEW_CHANNEL_ID")
+    if not review_channel_id:
+        await command_message.channel.send("REVIEW_CHANNEL_ID is not configured.")
+        return
+
+    try:
+        channel_id = int(review_channel_id)
+    except ValueError:
+        await command_message.channel.send("REVIEW_CHANNEL_ID is invalid.")
+        return
+
+    channel = client.get_channel(channel_id)
+    if channel is None:
+        try:
+            channel = await client.fetch_channel(channel_id)
+        except discord.DiscordException:
+            await command_message.channel.send(
+                "I couldn't access the configured review channel."
+            )
+            return
+
+    await command_message.channel.send(
+        "Historical review import started. I'll scan the channel first, "
+        "then archive the missing reviews with one reusable browser."
+    )
+
+    # First collect unique, not-yet-archived reviews in Discord order.
+    scanned = 0
+    found = 0
+    duplicates = 0
+    jobs = []
+    seen_urls = set()
+
+    async for message in channel.history(limit=None, oldest_first=True):
+        scanned += 1
+        if message.author.bot:
+            continue
+
+        for notion_url in extract_notion_urls(message.content):
+            found += 1
+            if notion_url in seen_urls:
+                duplicates += 1
+                continue
+            seen_urls.add(notion_url)
+
+            exists = await asyncio.to_thread(review_exists, notion_url)
+            if exists:
+                duplicates += 1
+                continue
+
+            trader_name = (
+                message.author.display_name
+                if hasattr(message.author, "display_name")
+                else message.author.name
+            )
+            jobs.append((message, notion_url, trader_name))
+
+    available_total = len(jobs)
+    if limit is not None:
+        jobs = jobs[:limit]
+
+    total = len(jobs)
+    limit_note = (
+        f" Testing the first **{total:,}**."
+        if limit is not None
+        else ""
+    )
+    await command_message.channel.send(
+        f"Scan complete: **{available_total:,}** reviews need archiving."
+        f"{limit_note} Starting download..."
+    )
+
+    if total == 0:
+        await command_message.channel.send("Nothing new to archive.")
+        return
+
+    loop = asyncio.get_running_loop()
+
+    archived = 0
+    errors = 0
+    successes_since_rest = 0
+
+    for index, (message, notion_url, trader_name) in enumerate(jobs, start=1):
+        try:
+            # Recheck immediately before download so reruns remain safe.
+            exists = await asyncio.to_thread(review_exists, notion_url)
+            if exists:
+                duplicates += 1
+                continue
+
+            posted_at = message.created_at.isoformat()
+            LOGGER.info(
+                "historical_import status=downloading review=%d/%d trader=%s",
+                index,
+                total,
+                trader_name,
+            )
+
+            result = await loop.run_in_executor(
+                REVIEW_IMPORT_EXECUTOR,
+                download_notion_review_hard_timeout,
+                notion_url,
+                trader_name,
+                posted_at,
+                300,
+            )
+
+            inserted = await asyncio.to_thread(
+                save_review,
+                message.author.id,
+                trader_name,
+                message.id,
+                message.jump_url,
+                notion_url,
+                result["title"],
+                result["text"],
+                posted_at,
+                result["archive_folder"],
+            )
+
+            if inserted:
+                archived += 1
+                successes_since_rest += 1
+                try:
+                    await message.add_reaction("✅")
+                except discord.HTTPException:
+                    pass
+            else:
+                duplicates += 1
+
+        except Exception as exc:
+            errors += 1
+            category = classify_review_error(exc)
+            LOGGER.exception(
+                "historical_import status=error category=%s message=%s url=%s",
+                category,
+                message.id,
+                notion_url,
+            )
+
+            if category == "rate_limit":
+                cooldown = random.uniform(
+                    RATE_LIMIT_COOLDOWN_MIN,
+                    RATE_LIMIT_COOLDOWN_MAX,
+                )
+                LOGGER.warning(
+                    "historical_import cooldown=rate_limit seconds=%.1f",
+                    cooldown,
+                )
+                await command_message.channel.send(
+                    f"Notion rate limit detected. Taking a long cooldown for "
+                    f"**{int(cooldown // 60)} minutes** before continuing."
+                )
+                await asyncio.sleep(cooldown)
+
+            elif category == "challenge":
+                cooldown = random.uniform(
+                    CHALLENGE_COOLDOWN_MIN,
+                    CHALLENGE_COOLDOWN_MAX,
+                )
+                LOGGER.warning(
+                    "historical_import cooldown=challenge seconds=%.1f",
+                    cooldown,
+                )
+                await command_message.channel.send(
+                    f"Notion challenge detected. Taking a long cooldown for "
+                    f"**{int(cooldown // 60)} minutes** before continuing."
+                )
+                await asyncio.sleep(cooldown)
+
+            elif category == "timeout":
+                cooldown = random.uniform(
+                    TIMEOUT_COOLDOWN_MIN,
+                    TIMEOUT_COOLDOWN_MAX,
+                )
+                LOGGER.warning(
+                    "historical_import cooldown=timeout seconds=%.1f",
+                    cooldown,
+                )
+                await asyncio.sleep(cooldown)
+
+            else:
+                await asyncio.sleep(8)
+
+        else:
+            if successes_since_rest >= BATCH_SUCCESS_TARGET:
+                rest = random.uniform(BATCH_REST_MIN, BATCH_REST_MAX)
+                LOGGER.warning(
+                    "historical_import batch_rest successes=%d seconds=%.1f",
+                    successes_since_rest,
+                    rest,
+                )
+                await command_message.channel.send(
+                    f"Archived **{successes_since_rest}** reviews since the last "
+                    f"batch rest. Resting for **{int(rest // 60)} minutes** "
+                    f"before continuing."
+                )
+                await asyncio.sleep(rest)
+                successes_since_rest = 0
+            else:
+                delay = random.uniform(SUCCESS_DELAY_MIN, SUCCESS_DELAY_MAX)
+                LOGGER.info("historical_import pacing seconds=%.1f", delay)
+                await asyncio.sleep(delay)
+
+        # Progress is based on reviews attempted, not Discord messages scanned.
+        if index % 25 == 0 or index == total:
+            await command_message.channel.send(
+                f"Import progress: **{index:,}/{total:,}** attempted, "
+                f"**{archived:,}** archived, **{errors:,}** errors."
+            )
+
+    await command_message.channel.send(
+        "**Historical review import complete.**\n"
+        f"Messages scanned: **{scanned:,}**\n"
+        f"Notion links found: **{found:,}**\n"
+        f"New reviews archived: **{archived:,}**\n"
+        f"Duplicates skipped: **{duplicates:,}**\n"
+        f"Errors: **{errors:,}**"
+    )
+
+async def count_historical_reviews(
+    command_message: discord.Message,
+) -> None:
+    """Count historical Notion reviews without downloading anything."""
+
+    review_channel_id = os.getenv("REVIEW_CHANNEL_ID")
+
+    if not review_channel_id:
+        await command_message.channel.send(
+            "REVIEW_CHANNEL_ID is not configured."
+        )
+        return
+
+    try:
+        channel_id = int(review_channel_id)
+    except ValueError:
+        await command_message.channel.send(
+            "REVIEW_CHANNEL_ID is invalid."
+        )
+        return
+
+    channel = client.get_channel(channel_id)
+
+    if channel is None:
+        try:
+            channel = await client.fetch_channel(channel_id)
+        except discord.DiscordException:
+            await command_message.channel.send(
+                "I couldn't access the configured review channel."
+            )
+            return
+
+    await command_message.channel.send(
+        "Counting historical reviews..."
+    )
+
+    scanned = 0
+    found = 0
+    unique_urls = set()
+    already_archived = 0
+
+    async for message in channel.history(
+        limit=None,
+        oldest_first=True,
+    ):
+        scanned += 1
+
+        if message.author.bot:
+            continue
+
+        notion_urls = extract_notion_urls(message.content)
+
+        for notion_url in notion_urls:
+            found += 1
+
+            if notion_url not in unique_urls:
+                unique_urls.add(notion_url)
+
+                exists = await asyncio.to_thread(
+                    review_exists,
+                    notion_url,
+                )
+
+                if exists:
+                    already_archived += 1
+
+    await command_message.channel.send(
+        "**Review count complete.**\n"
+        f"Messages scanned: **{scanned:,}**\n"
+        f"Notion links found: **{found:,}**\n"
+        f"Unique Notion reviews: **{len(unique_urls):,}**\n"
+        f"Already archived: **{already_archived:,}**\n"
+        f"Reviews remaining: **{len(unique_urls) - already_archived:,}**"
+    )
 
 class ChartBot(discord.Client):
     session: aiohttp.ClientSession | None = None
@@ -172,25 +616,143 @@ async def on_ready() -> None:
 
 @client.event
 async def on_message(message: discord.Message) -> None:
-    if message.author.bot or not message.content.startswith(PREFIX):
+
+    # Ignore messages sent by bots.
+    if message.author.bot:
+        return
+
+    # --------------------------------------------------
+    # TRADER REVIEW ARCHIVER
+    # --------------------------------------------------
+
+    review_channel_id = os.getenv("REVIEW_CHANNEL_ID")
+
+    if (
+        review_channel_id
+        and str(message.channel.id) == review_channel_id
+    ):
+        notion_urls = extract_notion_urls(message.content)
+
+        for notion_url in notion_urls:
+            asyncio.create_task(
+                archive_discord_review(
+                    message,
+                    notion_url,
+                )
+            )
+
+    # --------------------------------------------------
+    # EXISTING CHARTVF COMMANDS
+    # --------------------------------------------------
+
+    if not message.content.startswith(PREFIX):
         return
 
     command_text = message.content[len(PREFIX):].strip()
-    if not command_text:
-        await message.channel.send(HELP_TEXT, allowed_mentions=NO_MENTIONS)
+
+    # -----------------------------------------------
+    # REVIEW ADMIN COMMANDS
+    # -----------------------------------------------
+
+    if command_text.lower() == "countreviews":
+
+        if message.author.id != REVIEW_ADMIN_USER_ID:
+            await message.channel.send(
+                "You aren't authorized to run the review counter.",
+                allowed_mentions=NO_MENTIONS,
+            )
+            return
+
+        asyncio.create_task(
+            count_historical_reviews(message)
+        )
         return
-    if command_text.split(maxsplit=1)[0].lower() in {"help", "h"}:
-        await message.channel.send(HELP_TEXT, allowed_mentions=NO_MENTIONS)
+
+    if command_text.lower() == "resetreviews":
+        if message.author.id != REVIEW_ADMIN_USER_ID:
+            await message.channel.send("You aren't authorized to reset the review archive.", allowed_mentions=NO_MENTIONS)
+            return
+        await asyncio.to_thread(reset_review_archive)
+        await message.channel.send("Review archive reset: database rows and raw review folders cleared. Discord/Notion sources were not changed.", allowed_mentions=NO_MENTIONS)
+        return
+
+    if command_text.lower().startswith("importreviews"):
+
+        if message.author.id != REVIEW_ADMIN_USER_ID:
+            await message.channel.send(
+                "You aren't authorized to run the review importer.",
+                allowed_mentions=NO_MENTIONS,
+            )
+            return
+
+        parts = command_text.split()
+        import_limit = None
+
+        if len(parts) > 2:
+            await message.channel.send(
+                "Usage: `;importreviews` or `;importreviews 3`",
+                allowed_mentions=NO_MENTIONS,
+            )
+            return
+
+        if len(parts) == 2:
+            try:
+                import_limit = int(parts[1])
+            except ValueError:
+                await message.channel.send(
+                    "The import limit must be a whole number, for example `;importreviews 3`.",
+                    allowed_mentions=NO_MENTIONS,
+                )
+                return
+
+            if import_limit < 1 or import_limit > 100:
+                await message.channel.send(
+                    "For a limited test import, choose a number from 1 to 100.",
+                    allowed_mentions=NO_MENTIONS,
+                )
+                return
+
+        asyncio.create_task(
+            import_historical_reviews(message, import_limit)
+        )
+        return
+
+    # -----------------------------------------------
+    # NORMAL CHARTVF COMMANDS
+    # -----------------------------------------------
+
+    if not command_text:
+        await message.channel.send(
+            HELP_TEXT,
+            allowed_mentions=NO_MENTIONS,
+        )
+        return
+
+    if command_text.split(maxsplit=1)[0].lower() in {
+        "help",
+        "h",
+    }:
+        await message.channel.send(
+            HELP_TEXT,
+            allowed_mentions=NO_MENTIONS,
+        )
         return
 
     try:
         request = parse_chart_command(message.content)
+
     except ValueError as error:
-        await message.channel.send(str(error), allowed_mentions=NO_MENTIONS)
+        await message.channel.send(
+            str(error),
+            allowed_mentions=NO_MENTIONS,
+        )
         return
 
     if request:
-        await send_chart(message.channel, request)
+        await send_chart(
+            message.channel,
+            request,
+        )
 
 
 async def _request_json(
@@ -760,6 +1322,9 @@ async def send_chart(channel: discord.abc.Messageable, request: ChartRequest) ->
 
 def main() -> None:
     load_dotenv()
+
+    initialize_database()
+
     token = os.getenv("DISCORD_TOKEN")
     if not token:
         raise SystemExit("Missing DISCORD_TOKEN. Put it in .env or export it.")
